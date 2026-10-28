@@ -1,0 +1,36 @@
+[tool.poetry]
+name = "keep-reconciler"
+version = "0.55.1"
+description = "Re-ingest failed alerts from the AppChi -> Keep DLQ Kafka topic"
+authors = ["Keep Authors"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+fastapi = "^0.115.6"
+uvicorn = "^0.32.1"
+confluent-kafka = "^2.3.0"
+httpx = "^0.28.1"
+python-json-logger = "^2.0.6"
+pydantic-settings = "^2.0.0"
+requests = "^2.32.4"
+urllib3 = "<2.4.0"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+pytest-timeout = "^2.3.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+
+[tool.pytest.ini_options]
+# A default wall-clock bound for EVERY test, not just the ones that remembered
+# a marker. The Stop hook and CI both run pytest with no timeout of their own,
+# and this suite now contains daemon threads, a socket-polling loop and real
+# connection probes -- any one of which can hang a run indefinitely.
+# Per-test @pytest.mark.timeout still overrides this.
+timeout = 120
