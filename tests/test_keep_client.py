@@ -1,8 +1,10 @@
+import json
+
 import httpx
 import pytest
 
 from src import keep_client
-from src.keep_client import KeepClient, _preserve_last_received
+from src.keep_client import KeepClient, _preserve_last_received, fingerprint_of
 from src.models import DeliveryResult
 
 
@@ -56,6 +58,7 @@ class TestSend:
         assert len(requests) == 1
         assert str(requests[0].url) == "http://keep.test/alerts/event"
         assert requests[0].headers["X-API-KEY"] == "test-key"
+        assert requests[0].headers["X-Keep-DLQ-Replay"] == "1"
         assert b'"lastReceived":"t1"' in requests[0].content.replace(b" ", b"")
 
     def test_client_error_is_terminal_without_retry(self):
@@ -92,3 +95,38 @@ class TestSend:
 
         assert make_client(handler).send({"fingerprint": "f"}) == DeliveryResult.SUCCESS
         assert len(calls) == 2
+
+    def test_batch_is_sent_as_one_list(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(202)
+
+        result = make_client(handler).send(
+            [{"fingerprint": "a", "timestamp": "t1"}, {"fingerprint": "b"}]
+        )
+
+        assert result == DeliveryResult.SUCCESS
+        assert len(requests) == 1
+        body = json.loads(requests[0].content)
+        assert body == [
+            {"fingerprint": "a", "timestamp": "t1", "lastReceived": "t1"},
+            {"fingerprint": "b"},
+        ]
+
+
+def test_fingerprint_of_batch_is_comma_joined():
+    assert fingerprint_of({"fingerprint": "a"}) == "a"
+    assert fingerprint_of([{"fingerprint": "a"}, {"fingerprint": "b"}]) == "a,b"
+
+
+def test_replay_number_header():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(202)
+
+    make_client(handler).send({"fingerprint": "f"}, replay=4)
+    assert requests[0].headers["X-Keep-DLQ-Replay"] == "4"

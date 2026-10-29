@@ -4,10 +4,16 @@ import threading
 import time
 from typing import Any
 
-from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
+from confluent_kafka import (
+    TIMESTAMP_NOT_AVAILABLE,
+    Consumer,
+    KafkaError,
+    KafkaException,
+    TopicPartition,
+)
 
 from src.config import settings
-from src.keep_client import KeepClient
+from src.keep_client import KeepClient, fingerprint_of
 from src.models import DeliveryResult
 from src.state import ConsumerState
 
@@ -53,6 +59,15 @@ def commit(consumer: Consumer, msg) -> None:
     raise last_error if last_error else RuntimeError("Kafka commit failed")
 
 
+def _poll_paused(consumer: Consumer) -> None:
+    # poll() keeps the consumer in the group while its partitions are paused.
+    # A message fetched just before the pause can still come back here: rewind
+    # to it so it isn't skipped.
+    msg = consumer.poll(timeout=1.0)
+    if msg is not None and not msg.error():
+        consumer.seek(TopicPartition(msg.topic(), msg.partition(), msg.offset()))
+
+
 def backoff(consumer: Consumer, shutdown_event: threading.Event) -> None:
     logger.error(
         "Entering backoff: pausing processing for %d seconds",
@@ -65,8 +80,7 @@ def backoff(consumer: Consumer, shutdown_event: threading.Event) -> None:
     try:
         backoff_until = time.time() + settings.keep_backoff_seconds
         while time.time() < backoff_until and not shutdown_event.is_set():
-            # poll() keeps the consumer heartbeating while paused.
-            consumer.poll(timeout=1.0)
+            _poll_paused(consumer)
             shutdown_event.wait(timeout=settings.keep_poll_interval_seconds)
     finally:
         if partitions:
@@ -77,21 +91,74 @@ def backoff(consumer: Consumer, shutdown_event: threading.Event) -> None:
             logger.info("Backoff complete; resuming processing")
 
 
-def _extract_alert(payload: dict) -> tuple[dict, dict, str | None]:
+def _is_alert_or_batch(alert: Any) -> bool:
+    if isinstance(alert, dict):
+        return True
+    return isinstance(alert, list) and bool(alert) and all(
+        isinstance(item, dict) for item in alert
+    )
+
+
+def _extract_alert(payload: dict) -> tuple[dict | list[dict], dict, str | None]:
     # Two DLQ payload shapes reach this consumer:
     #  - keep-ingestion contract: {"alert": {...}, "error": {...}}
     #  - keep-api-gateway fallback: {"event": {...}, "event_type": "alert", ...}
     # Falling back to the raw payload keeps best-effort support for bare alerts.
     alert = payload.get("alert") or payload.get("event") or payload
     error = payload.get("error") or {}
-    fingerprint = alert.get("fingerprint") if isinstance(alert, dict) else None
+    fingerprint = fingerprint_of(alert) if _is_alert_or_batch(alert) else None
     return alert, error, fingerprint
+
+
+def _replay_count(payload: dict) -> int:
+    try:
+        return int(payload.get("dlq_replay_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wait_for_replay(
+    consumer: Consumer, msg, replay_count: int, shutdown_event: threading.Event
+) -> bool:
+    """Hold the alert until it has sat in the DLQ for the replay's delay.
+
+    The delay doubles per replay, so an alert keep-event-handler keeps failing
+    (e.g. a DB outage) is spaced out instead of looping straight back. Returns
+    False if shutdown interrupted the wait; the alert is then left uncommitted.
+    """
+    timestamp_type, timestamp_ms = msg.timestamp()
+    if timestamp_type == TIMESTAMP_NOT_AVAILABLE or timestamp_ms <= 0:
+        return True
+    ready_at = timestamp_ms / 1000 + settings.keep_replay_delay_seconds * 2**replay_count
+    if time.time() >= ready_at:
+        return True
+
+    logger.info(
+        "Delaying DLQ replay %d for %.0f seconds",
+        replay_count + 1,
+        ready_at - time.time(),
+    )
+    partitions = consumer.assignment() or []
+    if partitions:
+        consumer.pause(partitions)
+    try:
+        while time.time() < ready_at and not shutdown_event.is_set():
+            _poll_paused(consumer)
+    finally:
+        if partitions:
+            consumer.resume(partitions)
+    return not shutdown_event.is_set()
 
 
 def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
     with KeepClient() as keep_client:
         consumer = Consumer(kafka_config())
-        consumer.subscribe([settings.kafka_dlq_topic])
+        # Being assigned partitions means the consumer is back in the group, so
+        # /health recovers after a crash even while the DLQ is empty.
+        consumer.subscribe(
+            [settings.kafka_dlq_topic],
+            on_assign=lambda _consumer, _partitions: consumer_state.mark_healthy(),
+        )
         logger.info("Kafka consumer started")
         consecutive_failures = 0
 
@@ -134,22 +201,41 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     },
                 )
 
-                if not isinstance(alert, dict):
+                if not _is_alert_or_batch(alert):
                     logger.error(
-                        "DLQ alert field is not an object; skipping offset: %s",
+                        "DLQ alert field is not an object or a list of objects; skipping offset: %s",
                         type(alert).__name__,
                     )
                     commit(consumer, msg)
                     consumer_state.record_decode_error()
                     continue
 
-                result = keep_client.send(alert)
+                replay_count = _replay_count(payload)
+                if replay_count >= settings.keep_max_dlq_replays:
+                    logger.error(
+                        "Dropping DLQ alert after %d replays: fingerprint=%s",
+                        replay_count,
+                        fingerprint,
+                        extra={
+                            "fingerprint": fingerprint,
+                            "replays": replay_count,
+                            "dropped_alert": alert,
+                        },
+                    )
+                    commit(consumer, msg)
+                    consumer_state.record_dropped()
+                    continue
+
+                if not _wait_for_replay(consumer, msg, replay_count, shutdown_event):
+                    break
+
+                result = keep_client.send(alert, replay=replay_count + 1)
                 if result == DeliveryResult.SUCCESS:
                     logger.info(
                         "Successfully re-ingested DLQ alert: fingerprint=%s",
-                        alert.get("fingerprint"),
+                        fingerprint,
                         extra={
-                            "fingerprint": alert.get("fingerprint"),
+                            "fingerprint": fingerprint,
                             "result": result.value,
                         },
                     )
@@ -160,9 +246,9 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     logger.error(
                         "Failed to re-ingest DLQ alert (result=%s): fingerprint=%s",
                         result.value,
-                        alert.get("fingerprint"),
+                        fingerprint,
                         extra={
-                            "fingerprint": alert.get("fingerprint"),
+                            "fingerprint": fingerprint,
                             "result": result.value,
                         },
                     )
@@ -173,9 +259,9 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     logger.error(
                         "Failed to re-ingest DLQ alert (result=%s): fingerprint=%s",
                         result.value,
-                        alert.get("fingerprint"),
+                        fingerprint,
                         extra={
-                            "fingerprint": alert.get("fingerprint"),
+                            "fingerprint": fingerprint,
                             "result": result.value,
                         },
                     )

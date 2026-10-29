@@ -10,6 +10,10 @@ from src.models import DeliveryResult
 
 logger = logging.getLogger("keep-reconciler")
 
+# Tells keep-ingestion this is a replay: it must not divert it back into the
+# DLQ, and it carries the count on so the next DLQ write keeps it.
+REPLAY_HEADER = "X-Keep-DLQ-Replay"
+
 
 def _preserve_last_received(alert: dict[str, Any]) -> dict[str, Any]:
     """Ensure a replayed alert carries a stable `lastReceived`.
@@ -42,20 +46,35 @@ def _preserve_last_received(alert: dict[str, Any]) -> dict[str, Any]:
     return alert
 
 
+def fingerprint_of(alert: dict | list[dict]) -> str | None:
+    """The alert's fingerprint for logs; comma-joined for a batch."""
+    if isinstance(alert, list):
+        return ",".join(str(a.get("fingerprint")) for a in alert) or None
+    return alert.get("fingerprint")
+
+
 class KeepClient:
     def __init__(self, timeout: int | None = None):
         self.timeout = timeout or settings.keep_timeout_seconds
         self._client = httpx.Client(timeout=self.timeout)
 
-    def send(self, alert: dict) -> DeliveryResult:
-        alert = _preserve_last_received(alert)
+    def send(self, alert: dict | list[dict], replay: int = 1) -> DeliveryResult:
+        # /alerts/event accepts a batch too, so a list is resent as one request.
+        if isinstance(alert, list):
+            alert = [_preserve_last_received(item) for item in alert]
+        else:
+            alert = _preserve_last_received(alert)
+        fingerprint = fingerprint_of(alert)
         last_error: Exception | None = None
         for attempt in range(settings.keep_send_retries):
             try:
                 response = self._client.post(
                     settings.keep_alerts_event_url,
                     json=alert,
-                    headers={"X-API-KEY": settings.keep_api_key},
+                    headers={
+                        "X-API-KEY": settings.keep_api_key,
+                        REPLAY_HEADER: str(replay),
+                    },
                 )
                 if response.is_success:
                     return DeliveryResult.SUCCESS
@@ -66,7 +85,7 @@ class KeepClient:
                     logger.error(
                         "Keep rejected alert with terminal status %s: fingerprint=%s body=%s",
                         response.status_code,
-                        alert.get("fingerprint"),
+                        fingerprint,
                         response.text[:500],
                     )
                     return DeliveryResult.TERMINAL
@@ -76,7 +95,7 @@ class KeepClient:
                 logger.warning(
                     "Keep returned retryable status %s for fingerprint=%s (attempt %d/%d)",
                     response.status_code,
-                    alert.get("fingerprint"),
+                    fingerprint,
                     attempt + 1,
                     settings.keep_send_retries,
                 )
@@ -84,7 +103,7 @@ class KeepClient:
                 last_error = e
                 logger.error(
                     "Keep delivery attempt failed for fingerprint=%s: %s",
-                    alert.get("fingerprint"),
+                    fingerprint,
                     e,
                 )
             time.sleep(2**attempt)
@@ -92,7 +111,7 @@ class KeepClient:
         logger.error(
             "Keep delivery exhausted all %d retries for fingerprint=%s: %s(%s)",
             settings.keep_send_retries,
-            alert.get("fingerprint"),
+            fingerprint,
             type(last_error).__name__ if last_error else "unknown",
             last_error if last_error else "no error captured",
         )

@@ -11,6 +11,7 @@ class ConsumerState:
             "success_total": 0,
             "terminal_total": 0,
             "retryable_exhausted_total": 0,
+            "dropped_total": 0,
             "decode_errors_total": 0,
             "backoffs_total": 0,
         }
@@ -32,6 +33,11 @@ class ConsumerState:
             self.counters["messages_total"] += 1
             self.counters["retryable_exhausted_total"] += 1
 
+    def record_dropped(self):
+        with self._lock:
+            self.counters["messages_total"] += 1
+            self.counters["dropped_total"] += 1
+
     def record_decode_error(self):
         with self._lock:
             self.counters["decode_errors_total"] += 1
@@ -48,6 +54,10 @@ class ConsumerState:
     def mark_unhealthy(self):
         with self._lock:
             self.healthy = False
+
+    def mark_healthy(self):
+        with self._lock:
+            self.healthy = True
 
     def get_counters(self):
         with self._lock:

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     keep_consumer_restart_limit: int = 5
     keep_consumer_restart_window: int = 300
     keep_commit_retries: int = 3
+    # An alert keep-event-handler keeps failing would otherwise loop
+    # DLQ -> Keep -> DLQ forever: wait longer before each replay, then give up.
+    keep_max_dlq_replays: int = 5
+    keep_replay_delay_seconds: int = 30
 
     kafka_dlq_bootstrap_servers: str
     kafka_dlq_group_id: str = "keep-dlq-reingestion"
