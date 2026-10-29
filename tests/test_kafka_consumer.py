@@ -248,6 +248,26 @@ class TestReplays:
         assert keep.replays == [1]
 
 
+class TestReasons:
+    @pytest.mark.parametrize("reason", ["poison", "malformed"])
+    def test_unreplayable_reason_is_dropped_not_sent(self, run_consume, reason):
+        """They fail the same way every time: replaying only loops."""
+        consumer, keep, state = run_consume(
+            [message({"alert": {"fingerprint": "f"}, "error": {"reason": reason}}, 0)]
+        )
+        assert keep.sent == []
+        assert consumer.committed == [0]
+        assert state.get_counters()["dropped_total"] == 1
+
+    @pytest.mark.parametrize("reason", ["attempt_cap", "budget_exhausted", "unexpected", None])
+    def test_outage_reasons_are_replayed(self, run_consume, reason):
+        _, keep, _ = run_consume(
+            [message({"alert": {"fingerprint": "f"}, "error": {"reason": reason}}, 0)],
+            [DeliveryResult.SUCCESS],
+        )
+        assert [a["fingerprint"] for a in keep.sent] == ["f"]
+
+
 class FakeClock:
     def __init__(self, start: float):
         self.now = start
@@ -313,3 +333,18 @@ def test_assignment_marks_consumer_healthy_again(run_consume):
     state.mark_unhealthy()
     run_consume([], state=state)
     assert state.is_healthy()
+
+
+def test_replay_delay_is_capped(monkeypatch):
+    """After a few doublings every replay waits the max delay, so outage
+    failures keep being retried at a steady pace for about a day."""
+    clock = FakeClock(1000.0)
+    monkeypatch.setattr(kafka_consumer.time, "time", clock.time)
+    monkeypatch.setattr(kafka_consumer, "_poll_paused", lambda _c: None)
+    monkeypatch.setattr(kafka_consumer.settings, "keep_replay_delay_seconds", 30)
+    monkeypatch.setattr(kafka_consumer.settings, "keep_max_replay_delay_seconds", 600)
+    consumer = FakeConsumer([], threading.Event())
+    msg = message({}, 0, timestamp=(1, 1000 * 1000))
+
+    assert _wait_for_replay(consumer, msg, 40, threading.Event()) is True
+    assert 1000 + 600 <= clock.now <= 1000 + 602

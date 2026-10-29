@@ -19,6 +19,9 @@ from src.state import ConsumerState
 
 logger = logging.getLogger("keep-reconciler")
 
+# keep-event-handler failure reasons that fail the same way on every replay.
+UNREPLAYABLE_REASONS = {"poison", "malformed"}
+
 
 def kafka_config() -> dict[str, Any]:
     return {
@@ -122,14 +125,19 @@ def _wait_for_replay(
 ) -> bool:
     """Hold the alert until it has sat in the DLQ for the replay's delay.
 
-    The delay doubles per replay, so an alert keep-event-handler keeps failing
-    (e.g. a DB outage) is spaced out instead of looping straight back. Returns
+    The delay doubles per replay up to KEEP_MAX_REPLAY_DELAY_SECONDS, so an
+    alert keep-event-handler keeps failing (e.g. a DB outage) is spaced out
+    instead of looping straight back. Returns
     False if shutdown interrupted the wait; the alert is then left uncommitted.
     """
     timestamp_type, timestamp_ms = msg.timestamp()
     if timestamp_type == TIMESTAMP_NOT_AVAILABLE or timestamp_ms <= 0:
         return True
-    ready_at = timestamp_ms / 1000 + settings.keep_replay_delay_seconds * 2**replay_count
+    delay = min(
+        settings.keep_replay_delay_seconds * 2**replay_count,
+        settings.keep_max_replay_delay_seconds,
+    )
+    ready_at = timestamp_ms / 1000 + delay
     if time.time() >= ready_at:
         return True
 
@@ -208,6 +216,22 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     )
                     commit(consumer, msg)
                     consumer_state.record_decode_error()
+                    continue
+
+                reason = error.get("reason") if isinstance(error, dict) else None
+                if reason in UNREPLAYABLE_REASONS:
+                    logger.error(
+                        "Not replaying DLQ alert that failed as %s: fingerprint=%s",
+                        reason,
+                        fingerprint,
+                        extra={
+                            "fingerprint": fingerprint,
+                            "reason": reason,
+                            "dropped_alert": alert,
+                        },
+                    )
+                    commit(consumer, msg)
+                    consumer_state.record_dropped()
                     continue
 
                 replay_count = _replay_count(payload)
