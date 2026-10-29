@@ -4,7 +4,7 @@ import threading
 import time
 from typing import Any
 
-from confluent_kafka import Consumer, KafkaError, KafkaException
+from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
 
 from src.config import settings
 from src.keep_client import KeepClient
@@ -181,7 +181,14 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     )
                     consecutive_failures += 1
                     consumer_state.record_retryable_exhausted()
-                    # Do not commit: let Kafka redeliver after backoff / restart.
+
+                    # Skipping the commit alone isn't enough: poll() would move on
+                    # and the next commit would cover this offset too. Rewind so
+                    # the same alert is retried until Keep is back. Retryable
+                    # means Keep is unavailable, so later alerts would fail too.
+                    consumer.seek(
+                        TopicPartition(msg.topic(), msg.partition(), msg.offset())
+                    )
 
                 if consecutive_failures >= settings.keep_max_consecutive_failures:
                     consumer_state.record_backoff()

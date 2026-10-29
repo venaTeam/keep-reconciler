@@ -20,6 +20,12 @@ class FakeMessage:
     def offset(self):
         return self._offset
 
+    def topic(self):
+        return "keep-dlq"
+
+    def partition(self):
+        return 0
+
     def error(self):
         return None
 
@@ -28,9 +34,11 @@ class FakeConsumer:
     """Hands out the queued messages, then sets the shutdown event."""
 
     def __init__(self, messages, shutdown_event):
+        self.all_messages = {m.offset(): m for m in messages}
         self.messages = list(messages)
         self.shutdown_event = shutdown_event
         self.committed = []
+        self.seeks = []
         self.closed = False
 
     def subscribe(self, topics):
@@ -44,6 +52,14 @@ class FakeConsumer:
 
     def commit(self, msg):
         self.committed.append(msg.offset())
+
+    def seek(self, partition):
+        # Like Kafka: the next poll() starts again from the given offset.
+        self.seeks.append(partition.offset)
+        self.messages = [
+            m for offset, m in sorted(self.all_messages.items())
+            if offset >= partition.offset
+        ]
 
     def assignment(self):
         return []
@@ -133,12 +149,22 @@ class TestConsume:
         assert consumer.committed == [0]
         assert state.get_counters()["terminal_total"] == 1
 
-    def test_retryable_exhausted_does_not_commit(self, run_consume):
-        consumer, _, state = run_consume(
-            [message({"alert": {"fingerprint": "f"}}, 0)],
-            [DeliveryResult.RETRYABLE_EXHAUSTED],
+    def test_retryable_exhausted_retries_same_alert(self, run_consume):
+        consumer, keep, state = run_consume(
+            [
+                message({"alert": {"fingerprint": "f0"}}, 0),
+                message({"alert": {"fingerprint": "f1"}}, 1),
+            ],
+            [
+                DeliveryResult.RETRYABLE_EXHAUSTED,
+                DeliveryResult.SUCCESS,
+                DeliveryResult.SUCCESS,
+            ],
         )
-        assert consumer.committed == []
+        # f0 is rewound and sent again instead of being skipped by f1's commit.
+        assert [a["fingerprint"] for a in keep.sent] == ["f0", "f0", "f1"]
+        assert consumer.seeks == [0]
+        assert consumer.committed == [0, 1]
         assert state.get_counters()["retryable_exhausted_total"] == 1
 
     @pytest.mark.parametrize(
