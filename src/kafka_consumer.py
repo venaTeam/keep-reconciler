@@ -45,19 +45,23 @@ def commit(consumer: Consumer, msg) -> None:
             return
         except Exception as e:
             last_error = e
-            logger.error(
-                "Kafka commit attempt %d/%d failed: %s",
-                attempt + 1,
-                settings.keep_commit_retries,
-                e,
+            logger.warning(
+                "Kafka commit attempt failed",
+                extra={
+                    "attempt": attempt + 1,
+                    "max_attempts": settings.keep_commit_retries,
+                    "error": str(e),
+                },
             )
             if attempt < settings.keep_commit_retries - 1:
                 time.sleep(2**attempt)
     logger.error(
-        "Kafka commit failed after %d attempts; raising to restart consumer: %s(%s)",
-        settings.keep_commit_retries,
-        type(last_error).__name__ if last_error else "unknown",
-        last_error if last_error else "no error captured",
+        "Kafka commit failed; raising to restart consumer",
+        extra={
+            "attempts": settings.keep_commit_retries,
+            "error_type": type(last_error).__name__ if last_error else "unknown",
+            "error": str(last_error) if last_error else "no error captured",
+        },
     )
     raise last_error if last_error else RuntimeError("Kafka commit failed")
 
@@ -72,10 +76,6 @@ def _poll_paused(consumer: Consumer) -> None:
 
 
 def backoff(consumer: Consumer, shutdown_event: threading.Event) -> None:
-    logger.error(
-        "Entering backoff: pausing processing for %d seconds",
-        settings.keep_backoff_seconds,
-    )
     partitions = consumer.assignment() or []
     if partitions:
         consumer.pause(partitions)
@@ -92,6 +92,10 @@ def backoff(consumer: Consumer, shutdown_event: threading.Event) -> None:
             logger.info("Backoff interrupted by shutdown signal")
         else:
             logger.info("Backoff complete; resuming processing")
+
+
+def _record_position(msg) -> dict:
+    return {"topic": msg.topic(), "partition": msg.partition(), "offset": msg.offset()}
 
 
 def _is_alert_or_batch(alert: Any) -> bool:
@@ -121,7 +125,11 @@ def _replay_count(payload: dict) -> int:
 
 
 def _wait_for_replay(
-    consumer: Consumer, msg, replay_count: int, shutdown_event: threading.Event
+    consumer: Consumer,
+    msg,
+    replay_count: int,
+    shutdown_event: threading.Event,
+    log_context: dict | None = None,
 ) -> bool:
     """Hold the alert until it has sat in the DLQ for the replay's delay.
 
@@ -142,9 +150,12 @@ def _wait_for_replay(
         return True
 
     logger.info(
-        "Delaying DLQ replay %d for %.0f seconds",
-        replay_count + 1,
-        ready_at - time.time(),
+        "Delaying DLQ replay",
+        extra={
+            **(log_context or {}),
+            "replay": replay_count + 1,
+            "delay_seconds": round(ready_at - time.time()),
+        },
     )
     partitions = consumer.assignment() or []
     if partitions:
@@ -167,7 +178,13 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
             [settings.kafka_dlq_topic],
             on_assign=lambda _consumer, _partitions: consumer_state.mark_healthy(),
         )
-        logger.info("Kafka consumer started")
+        logger.info(
+            "Kafka consumer started",
+            extra={
+                "topic": settings.kafka_dlq_topic,
+                "group_id": settings.kafka_dlq_group_id,
+            },
+        )
         consecutive_failures = 0
 
         try:
@@ -183,49 +200,60 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                 try:
                     payload = json.loads(msg.value().decode("utf-8"))
                 except Exception:
-                    logger.exception("Failed to decode DLQ message; skipping offset")
+                    logger.exception(
+                        "Failed to decode DLQ message; skipping offset",
+                        extra=_record_position(msg),
+                    )
                     commit(consumer, msg)
                     consumer_state.record_decode_error()
                     continue
 
                 if not isinstance(payload, dict):
                     logger.error(
-                        "DLQ message payload is not a JSON object; skipping offset: %s",
-                        type(payload).__name__,
+                        "DLQ message payload is not a JSON object; skipping offset",
+                        extra={
+                            **_record_position(msg),
+                            "payload_type": type(payload).__name__,
+                        },
                     )
                     commit(consumer, msg)
                     consumer_state.record_decode_error()
                     continue
 
                 alert, error, fingerprint = _extract_alert(payload)
+                reason = error.get("reason") if isinstance(error, dict) else None
+                replay_count = _replay_count(payload)
+                log_context = {
+                    "fingerprint": fingerprint,
+                    "trace_id": payload.get("trace_id"),
+                    "tenant_id": payload.get("tenant_id"),
+                }
+                if isinstance(alert, list):
+                    log_context["alerts_count"] = len(alert)
 
                 logger.info(
-                    "DLQ alert received from alerts-gateway: fingerprint=%s error=%s",
-                    fingerprint,
-                    error,
-                    extra={
-                        "fingerprint": fingerprint,
-                        "error": error,
-                    },
+                    "DLQ alert received",
+                    extra={**log_context, "reason": reason, "replay": replay_count},
                 )
 
                 if not _is_alert_or_batch(alert):
                     logger.error(
-                        "DLQ alert field is not an object or a list of objects; skipping offset: %s",
-                        type(alert).__name__,
+                        "DLQ alert field is not an object or a list of objects; skipping offset",
+                        extra={
+                            **_record_position(msg),
+                            **log_context,
+                            "payload_type": type(alert).__name__,
+                        },
                     )
                     commit(consumer, msg)
                     consumer_state.record_decode_error()
                     continue
 
-                reason = error.get("reason") if isinstance(error, dict) else None
                 if reason in UNREPLAYABLE_REASONS:
                     logger.error(
-                        "Not replaying DLQ alert that failed as %s: fingerprint=%s",
-                        reason,
-                        fingerprint,
+                        "Not replaying DLQ alert that failed as poison or malformed",
                         extra={
-                            "fingerprint": fingerprint,
+                            **log_context,
                             "reason": reason,
                             "dropped_alert": alert,
                         },
@@ -234,14 +262,11 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     consumer_state.record_dropped()
                     continue
 
-                replay_count = _replay_count(payload)
                 if replay_count >= settings.keep_max_dlq_replays:
                     logger.error(
-                        "Dropping DLQ alert after %d replays: fingerprint=%s",
-                        replay_count,
-                        fingerprint,
+                        "Dropping DLQ alert after max replays",
                         extra={
-                            "fingerprint": fingerprint,
+                            **log_context,
                             "replays": replay_count,
                             "dropped_alert": alert,
                         },
@@ -250,16 +275,18 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     consumer_state.record_dropped()
                     continue
 
-                if not _wait_for_replay(consumer, msg, replay_count, shutdown_event):
+                if not _wait_for_replay(
+                    consumer, msg, replay_count, shutdown_event, log_context
+                ):
                     break
 
                 result = keep_client.send(alert, replay=replay_count + 1)
                 if result == DeliveryResult.SUCCESS:
                     logger.info(
-                        "Successfully re-ingested DLQ alert: fingerprint=%s",
-                        fingerprint,
+                        "DLQ alert re-ingested",
                         extra={
-                            "fingerprint": fingerprint,
+                            **log_context,
+                            "replay": replay_count + 1,
                             "result": result.value,
                         },
                     )
@@ -268,26 +295,16 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     commit(consumer, msg)
                 elif result == DeliveryResult.TERMINAL:
                     logger.error(
-                        "Failed to re-ingest DLQ alert (result=%s): fingerprint=%s",
-                        result.value,
-                        fingerprint,
-                        extra={
-                            "fingerprint": fingerprint,
-                            "result": result.value,
-                        },
+                        "Failed to re-ingest DLQ alert",
+                        extra={**log_context, "result": result.value},
                     )
                     consecutive_failures += 1
                     consumer_state.record_terminal()
                     commit(consumer, msg)
                 else:
-                    logger.error(
-                        "Failed to re-ingest DLQ alert (result=%s): fingerprint=%s",
-                        result.value,
-                        fingerprint,
-                        extra={
-                            "fingerprint": fingerprint,
-                            "result": result.value,
-                        },
+                    logger.warning(
+                        "Failed to re-ingest DLQ alert; will retry",
+                        extra={**log_context, "result": result.value},
                     )
                     consecutive_failures += 1
                     consumer_state.record_retryable_exhausted()
@@ -303,8 +320,7 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                 if consecutive_failures >= settings.keep_max_consecutive_failures:
                     consumer_state.record_backoff()
                     logger.error(
-                        "Entering backoff after %d consecutive failures",
-                        consecutive_failures,
+                        "Entering backoff after consecutive failures",
                         extra={
                             "consecutive_failures": consecutive_failures,
                             "backoff_seconds": settings.keep_backoff_seconds,
