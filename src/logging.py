@@ -1,9 +1,7 @@
-import http.client
 import inspect
 import json
 import logging
 import logging.config
-import logging.handlers
 import os
 import queue
 import sys
@@ -18,7 +16,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-KEEP_LOG_FILE = os.environ.get("KEEP_LOG_FILE", "false").lower() == "true"
 KEEP_FLUENTBIT = os.environ.get("KEEP_FLUENTBIT", "true").lower() == "true"
 KEEP_FLUENTBIT_HOST = os.environ.get("KEEP_FLUENTBIT_HOST")
 KEEP_FLUENTBIT_PORT = os.environ.get("KEEP_FLUENTBIT_PORT", "80")
@@ -166,13 +163,6 @@ class CustomJsonFormatter(jsonlogger.JsonFormatter):
         super().add_fields(log_record, record, message_dict)
 
 
-class UvicornAccessFormatter(logging.Formatter):
-    def format(self, record):
-        if not hasattr(record, "otelTraceID"):
-            record.otelTraceID = "-"
-        return super().format(record)
-
-
 CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -192,10 +182,6 @@ CONFIG = {
             "()": DevTerminalFormatter,
             "format": "%(asctime)s - %(otelTraceID)s %(threadName)s %(levelname)s - %(message)s",
         },
-        "uvicorn_access": {
-            "()": UvicornAccessFormatter,
-            "format": "%(asctime)s - %(otelTraceID)s - %(threadName)s - %(message)s",
-        },
     },
     "handlers": {
         "default": {
@@ -204,12 +190,6 @@ CONFIG = {
                 "json" if LOG_FORMAT == LOG_FORMAT_OPEN_TELEMETRY else "dev_terminal"
             ),
             "class": "logging.StreamHandler",
-            "stream": "ext://sys.stdout",
-            "filters": ["otel_fields"],
-        },
-        "uvicorn_access": {
-            "class": "logging.StreamHandler",
-            "formatter": "uvicorn_access",
             "stream": "ext://sys.stdout",
             "filters": ["otel_fields"],
         },
@@ -224,9 +204,8 @@ CONFIG = {
             "propagate": False,
         },
         "uvicorn.access": {
-            "()": "src.logging.CustomizedUvicornLogger",
-            "handlers": ["uvicorn_access"],
-            "level": get_gunicorn_log_level(),
+            "handlers": [],
+            "level": "WARNING",
             "propagate": False,
         },
         "uvicorn.error": {
@@ -243,11 +222,6 @@ CONFIG = {
         "httpx": {
             "handlers": [],
             "level": "ERROR",
-            "propagate": False,
-        },
-        "http.client": {
-            "handlers": ["default"],
-            "level": "DEBUG",
             "propagate": False,
         },
     },
@@ -319,21 +293,9 @@ class CustomizedUvicornLogger(logging.Logger):
 
 
 def setup_logging():
-    if KEEP_LOG_FILE:
-        CONFIG["handlers"]["file"] = {
-            "level": "DEBUG",
-            "formatter": "json",
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": KEEP_LOG_FILE,
-            "mode": "a",
-            "maxBytes": 1024 * 1024 * 1024,
-            "backupCount": 5,
-        }
-        CONFIG["loggers"][""]["handlers"].append("file")
-
-    if KEEP_FLUENTBIT:
+    if KEEP_FLUENTBIT and KEEP_FLUENTBIT_HOST:
         CONFIG["handlers"]["fluentbit"] = {
-            "level": "DEBUG",
+            "level": LOG_LEVEL,
             "formatter": "json",
             "class": "src.logging.FluentBitHandler",
             "host": KEEP_FLUENTBIT_HOST,
@@ -343,12 +305,3 @@ def setup_logging():
         CONFIG["loggers"][""]["handlers"].append("fluentbit")
 
     logging.config.dictConfig(CONFIG)
-
-    http_client_logger = logging.getLogger("http.client")
-    http_client_logger.setLevel(logging.DEBUG)
-    http.client.HTTPConnection.debuglevel = 1
-
-    def print_to_log(*args):
-        http_client_logger.debug(" ".join(args))
-
-    http.client.print = print_to_log
