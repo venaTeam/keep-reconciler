@@ -40,7 +40,7 @@ def _preserve_last_received(alert: dict[str, Any]) -> dict[str, Any]:
             return {**alert, "lastReceived": value}
 
     logger.warning(
-        "DLQ alert has no lastReceived/timestamp fallback; gateway will default to now",
+        "DLQ alert has no lastReceived/timestamp fallback; Keep will default to now",
         extra={"fingerprint": alert.get("fingerprint")},
     )
     return alert
@@ -64,7 +64,9 @@ class KeepClient:
             alert = [_preserve_last_received(item) for item in alert]
         else:
             alert = _preserve_last_received(alert)
-        fingerprint = fingerprint_of(alert)
+        log_context = {"fingerprint": fingerprint_of(alert)}
+        if isinstance(alert, list):
+            log_context["alerts_count"] = len(alert)
         last_error: Exception | None = None
         for attempt in range(settings.keep_send_retries):
             try:
@@ -83,37 +85,47 @@ class KeepClient:
                     and response.status_code != status.HTTP_429_TOO_MANY_REQUESTS
                 ):
                     logger.error(
-                        "Keep rejected alert with terminal status %s: fingerprint=%s body=%s",
-                        response.status_code,
-                        fingerprint,
-                        response.text[:500],
+                        "Keep rejected alert with terminal status",
+                        extra={
+                            **log_context,
+                            "status_code": response.status_code,
+                            "response_body": response.text[:500],
+                        },
                     )
                     return DeliveryResult.TERMINAL
                 last_error = Exception(
                     f"HTTP {response.status_code}: {response.text[:500]}"
                 )
                 logger.warning(
-                    "Keep returned retryable status %s for fingerprint=%s (attempt %d/%d)",
-                    response.status_code,
-                    fingerprint,
-                    attempt + 1,
-                    settings.keep_send_retries,
+                    "Keep returned retryable status",
+                    extra={
+                        **log_context,
+                        "status_code": response.status_code,
+                        "attempt": attempt + 1,
+                        "max_attempts": settings.keep_send_retries,
+                    },
                 )
             except Exception as e:
                 last_error = e
-                logger.error(
-                    "Keep delivery attempt failed for fingerprint=%s: %s",
-                    fingerprint,
-                    e,
+                logger.warning(
+                    "Keep delivery attempt failed",
+                    extra={
+                        **log_context,
+                        "attempt": attempt + 1,
+                        "max_attempts": settings.keep_send_retries,
+                        "error": str(e),
+                    },
                 )
             time.sleep(2**attempt)
 
         logger.error(
-            "Keep delivery exhausted all %d retries for fingerprint=%s: %s(%s)",
-            settings.keep_send_retries,
-            fingerprint,
-            type(last_error).__name__ if last_error else "unknown",
-            last_error if last_error else "no error captured",
+            "Keep delivery exhausted all retries",
+            extra={
+                **log_context,
+                "retries": settings.keep_send_retries,
+                "error_type": type(last_error).__name__ if last_error else "unknown",
+                "error": str(last_error) if last_error else "no error captured",
+            },
         )
         return DeliveryResult.RETRYABLE_EXHAUSTED
 

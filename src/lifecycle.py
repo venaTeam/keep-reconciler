@@ -25,14 +25,15 @@ def _start_consumer_threads(
             ]
             if len(restart_times) >= settings.keep_consumer_restart_limit:
                 logger.error(
-                    "Consumer restarted %d times in %d seconds; exiting process",
-                    settings.keep_consumer_restart_limit,
-                    settings.keep_consumer_restart_window,
+                    "Consumer restarted too often; exiting process",
+                    extra={
+                        "restart_limit": settings.keep_consumer_restart_limit,
+                        "restart_window_s": settings.keep_consumer_restart_window,
+                    },
                 )
                 os._exit(1)
             restart_times.append(now)
 
-            logger.info("Starting consumer thread")
             try:
                 consume(shutdown_event, consumer_state)
             except Exception:
@@ -40,7 +41,7 @@ def _start_consumer_threads(
                 consumer_state.mark_unhealthy()
             if shutdown_event.is_set():
                 break
-            logger.info("Consumer thread exited; restarting in 5 seconds")
+            logger.warning("Consumer thread exited; restarting in 5 seconds")
             time.sleep(5)
 
     consumer_thread = threading.Thread(target=run_consumer, daemon=True)
