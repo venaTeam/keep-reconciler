@@ -227,6 +227,9 @@ def consume(shutdown_event: threading.Event, consumer_state: ConsumerState):
                     "fingerprint": fingerprint,
                     "trace_id": payload.get("trace_id"),
                     "tenant_id": payload.get("tenant_id"),
+                    # whole DLQ error (class, code, reason); not "error", which
+                    # the ES template maps as text
+                    "dlq_error": error if isinstance(error, dict) else None,
                 }
                 if isinstance(alert, list):
                     log_context["alerts_count"] = len(alert)
